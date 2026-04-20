@@ -34,3 +34,7 @@ All notable changes to the **iDar-Loom** project will be documented in this file
 - Added `sleep_spam.lua` to test timer resolution and wake-up accuracy.
 - Added `mixed_load.lua` to benchmark the scheduler's ability to juggle CPU, I/O, and Sleep operations concurrently.
 - Added `parallel_test.lua` to verify the stability of the rewritten `parallel` API within the sandbox.
+
+### v1.0.1
+
+Bug fixes and performance improvements

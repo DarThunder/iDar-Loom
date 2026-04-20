@@ -29,7 +29,7 @@ function scheduler.execute()
         local event_data = {}
 
         if needs_cpu and not initial_start then
-            os.queueEvent("kernel_tick")
+            os.startTimer(0)
         end
 
         if not initial_start then
@@ -49,34 +49,19 @@ function scheduler.execute()
                 scheduler.active_thread_meta = process.threads[t]
                 local active_meta = scheduler.active_thread_meta
                 local should_resume = true
-                local args_to_pass = event_data
-
-                if event_data[1] == "kernel_tick" then
-                    if active_meta.filter or active_meta.wake_time then
+                
+                if active_meta.filter and active_meta.filter ~= event_data[1] then
+                    if event_data[1] ~= "terminate" then
                         should_resume = false
-                    end
-                    args_to_pass = {}
-                else
-                    if active_meta.wake_time then
-                        if os.clock() >= active_meta.wake_time then
-                            active_meta.wake_time = nil
-                            args_to_pass = {}
-                        else
-                            should_resume = false
-                        end
-                    elseif active_meta.filter and active_meta.filter ~= event_data[1] then
-                        if event_data[1] ~= "terminate" then
-                            should_resume = false
-                        end
                     end
                 end
 
                 if should_resume then
                     active_meta.start_time = os.epoch("utc")
                     active_meta.forced_yield = false
-                    local ok, yielded_val, extra_val = coroutine.resume(
+                    local ok, yielded_val = coroutine.resume(
                         active_meta.co, 
-                        table.unpack(args_to_pass, 1, args_to_pass.n or #args_to_pass)
+                        table.unpack(event_data, 1, event_data.n or #event_data)
                     )
 
                     if ok and not active_meta.forced_yield then
@@ -91,11 +76,7 @@ function scheduler.execute()
                         table.remove(process.threads, t)
                         t = t - 1
                     else
-                        if yielded_val == "SYSTEM_SLEEP" then
-                            active_meta.wake_time = extra_val
-                            active_meta.filter = nil
-
-                        elseif active_meta.forced_yield then
+                        if active_meta.forced_yield then
                             active_meta.filter = nil
                             needs_cpu = true
                         else
@@ -111,6 +92,7 @@ function scheduler.execute()
             scheduler.active_thread_meta = nil
 
             if #process.threads == 0 then
+                os.queueEvent("process_dead", process.pid)
                 table.remove(scheduler.processes, p)
             else
                 p = p + 1
