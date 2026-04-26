@@ -1,6 +1,7 @@
-local config = require("..iDar.Loom.src.config")
-local scheduler = require("..iDar.Loom.src.scheduler")
-local sandbox = require("..iDar.Loom.src.sandbox")
+local config = require("iDar.opt.Loom.config")
+local scheduler = require("iDar.opt.Loom.scheduler")
+local sandbox = require("iDar.opt.Loom.sandbox")
+local vfs = require("iDar.opt.Loom.vfs")
 
 local core = {}
 local next_pid = 1
@@ -10,10 +11,11 @@ function core.setExtensionTime(time) config.extension_time = time end
 function core.setMaxTime(time) config.max_time = time end
 
 function core.launch(app_route, options, ...)
-    local file = io.open(app_route, "r")
-    if not file then error("Can't open: " .. tostring(app_route)) end
-    local content = file:read("*a")
-    file:close()
+    local content, err_msg = vfs.kernel_read_file("/iDar", options and options.cwd or nil, app_route)
+    if not content then error("System Launch Error: " .. tostring(err_msg)) end
+
+    local pid = next_pid
+    next_pid = next_pid + 1
 
     local syscalls = {
         launch = function(path, options, ...)
@@ -21,8 +23,11 @@ function core.launch(app_route, options, ...)
         end
     }
 
-    local env = sandbox.create(syscalls, options and options.term or nil)
+    vfs.register_process(pid, "/iDar", options)
+
+    local env = sandbox.create(syscalls, options and options.term or nil, pid)
     local func, err = load(content, app_route, "t", env)
+
     if not func then error("Error: " .. tostring(err)) end
 
     local args = {...}
@@ -33,9 +38,6 @@ function core.launch(app_route, options, ...)
 
     local main_co = coroutine.create(wrapper)
     debug.sethook(main_co, scheduler.force_round_robin, "", config.hook_instructions)
-
-    local pid = next_pid
-    next_pid = next_pid + 1
 
     local new_process = {
         pid = pid,

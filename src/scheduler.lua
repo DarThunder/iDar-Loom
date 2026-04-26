@@ -1,4 +1,6 @@
-local config = require("..iDar.Loom.src.config")
+local config = require("iDar.opt.Loom.config")
+local vfs = require("iDar.opt.Loom.vfs")
+local krng = require("iDar.opt.Loom.krng")
 
 local scheduler = {
     processes = {},
@@ -24,6 +26,7 @@ end
 function scheduler.execute()
     local initial_start = true
     local needs_cpu = true
+    local last_event_time = os.clock()
 
     while #scheduler.processes > 0 do
         local event_data = {}
@@ -34,6 +37,21 @@ function scheduler.execute()
 
         if not initial_start then
             event_data = table.pack(os.pullEventRaw())
+        end
+
+        if event_data and event_data[1] then
+            local now = os.clock()
+            local inter_event_jitter = tostring(math.floor((now - last_event_time) * 1e9))
+            last_event_time = now
+            local garbage_parts = {}
+
+            for i = 1, event_data.n do
+                table.insert(garbage_parts, tostring(event_data[i]))
+            end
+
+            local garbage = table.concat(garbage_parts, ":") .. ":" .. tostring(now) .. ":" .. inter_event_jitter
+
+            krng.add_entropy(garbage)
         end
 
         initial_start = false
@@ -92,6 +110,7 @@ function scheduler.execute()
             scheduler.active_thread_meta = nil
 
             if #process.threads == 0 then
+                vfs.cleanup_process(process.pid)
                 os.queueEvent("process_dead", process.pid)
                 table.remove(scheduler.processes, p)
             else
