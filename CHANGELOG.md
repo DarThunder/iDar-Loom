@@ -65,3 +65,33 @@ Bug fixes and performance improvements
 
 - Refactored process registration to handle the new advanced VFS structures and process-specific file descriptors.
 - Removed legacy "Artificial Ticks" logic (`kernel_tick`), replacing it with optimized event yielding that handles CPU needs dynamically.
+
+### v3.0.0
+
+### Added
+
+#### Core Kernel & Scheduler
+
+- **Completely Fair Scheduler (CFS):** Replaced the legacy Round-Robin scheduler with a highly advanced CFS. Thread execution is now determined by a `vruntime` (virtual runtime) variable tracked inside a binary Min-Heap (`binary_heap.lua`), ensuring perfectly fair CPU distribution.
+- **Priority Weighting:** Introduced the `superrr` parameter (niceness) for processes. Threads with higher `superrr` values accumulate `vruntime` slower, granting them more physical CPU time relative to standard background tasks.
+
+#### Security & Permissions
+
+- **UID-based Sandboxing:** The VFS now enforces strict read/write permissions. Every process operates under a User ID (`uid`), and file access is evaluated against rules defined in `/etc/permissions.conf`.
+- **Sudo & Authentication:** Added the `sys.sudo(username, password, ...)` syscall. It securely hashes the input using SHA-256 and authenticates against `/etc/shadow` and `/etc/group`. If successful (and the user is in the `wheel` group), it spawns a child process with `UID 0` (root privileges).
+
+#### Networking & Sockets
+
+- **Socket Abstraction:** Modems are now natively treated as network interface file descriptors (`FD_TYPE.SOCKET`).
+- **Network Syscalls:** Introduced a complete networking stack inside the `sys` API: `sys.socket()`, `sys.bind()`, `sys.connect()`, `sys.send()`, and `sys.recv()`.
+- **Kernel-level Packet Routing:** Physical `modem_message` events are no longer broadcasted blindly to all processes. The kernel natively intercepts them and routes the payload exclusively to the file descriptor buffer of the process bound to the receiving port.
+
+#### Cryptography & Advanced VFS
+
+- **Native Crypto Syscalls:** Exposed the kernel's internal cryptographic capabilities to userspace. Applications can now natively call `sys.encrypt()` (ChaCha20 stream cipher) and `sys.sha256()` without needing external Lua libraries.
+- **Shared Library Caching:** Optimized the sandboxed `require()` function to maintain a `shared_lib_cache` in memory, drastically reducing VFS disk reads when multiple processes require the same standard libraries.
+
+### Changed
+
+- **Coroutine Hook Evolution:** The `debug.sethook` implementation was refactored to support the new `vruntime` calculation and forced-yield logic of the CFS Min-Heap.
+- **Global Environment (`_OS`):** Kernel version in the injected `_OS` table bumped to reflect the Alpha 3 microkernel architecture.

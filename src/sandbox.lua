@@ -1,8 +1,13 @@
 local config = require("iDar.opt.Loom.config")
 local scheduler = require("iDar.opt.Loom.scheduler")
+local net_driver = require("iDar.opt.Loom.drivers.net")
+local krng = require("iDar.opt.Loom.krng")
 
 local sandbox = {}
 local shared_lib_cache = {}
+local current_fg_pid = nil
+local sudo_cache = {}
+local SUDO_TIMEOUT = 300000
 
 function sandbox.create(syscalls, custom_term, pid)
     local env = {
@@ -31,7 +36,6 @@ function sandbox.create(syscalls, custom_term, pid)
         assert = assert,
         pcall = pcall,
         xpcall = xpcall,
-        load = load,
         iDarBoot = iDarBoot,
         colors = colors,
         keys = keys,
@@ -40,7 +44,8 @@ function sandbox.create(syscalls, custom_term, pid)
         http = http,
         bit32 = bit32,
         bit = bit,
-
+        utf8 = utf8,
+        getmetatable = getmetatable
     }
 
     local function load_packages()
@@ -104,13 +109,28 @@ function sandbox.create(syscalls, custom_term, pid)
             return pid
         end,
         set_foreground = function(target_pid)
+            local state = vfs_syscalls.get_process(target_pid)
+            if not state then return end
+
+            if current_fg_pid and vfs_syscalls.get_process(current_fg_pid) then
+                local current_fg = vfs_syscalls.get_process(current_fg_pid)
+                current_fg.tty.setVisible(false)
+                current_fg.is_foreground = false
+            end
+
+            current_fg_pid = target_pid
+            state.is_foreground = true
+
+            state.tty.setVisible(true)
+
+            state.tty.restoreCursor()
             _G.os.queueEvent("set_foreground", target_pid)
         end,
         pull_input = function()
             while true do
                 local event_data = table.pack(coroutine.yield())
                 local event_name = event_data[1]
-                
+
                 if event_name == "fg_char_" .. pid then
                     return "char", event_data[2]
                 elseif event_name == "fg_key_" .. pid then
@@ -123,7 +143,16 @@ function sandbox.create(syscalls, custom_term, pid)
         open = vfs_syscalls.open,
         write = vfs_syscalls.write,
         read = vfs_syscalls.read,
-        close = vfs_syscalls.close,
+        close = function(fd)
+            local state = vfs_syscalls.get_process(pid)
+            if state and state.fds[fd] and state.fds[fd].type == "socket" then
+                local fd_obj = state.fds[fd]
+                if fd_obj.local_port then
+                    net_driver.close(pid, fd_obj)
+                end
+            end
+            return vfs_syscalls.close(fd)
+        end,
         pipe = vfs_syscalls.pipe,
         exists = vfs_syscalls.exists,
         is_dir = vfs_syscalls.is_dir,
@@ -138,11 +167,140 @@ function sandbox.create(syscalls, custom_term, pid)
         get_dir = vfs_syscalls.get_dir,
         move = vfs_syscalls.move,
         delete = vfs_syscalls.delete,
-        dofile = vfs_syscalls.dofile,
+        dofile = function(path)
+            local fd, err = env.sys.open(path, "r")
+            if not fd then error(err) end
+            local content = env.sys.read(fd)
+            env.sys.close(fd)
+
+            local func, load_err = env.load(content, path, "t", env)
+            if not func then error(load_err) end
+            return func()
+        end,
         get_capacity = vfs_syscalls.get_capacity,
         get_free_space = vfs_syscalls.get_free_space,
         get_cwd = vfs_syscalls.get_cwd,
         set_cwd = vfs_syscalls.set_cwd,
+        get_tty = vfs_syscalls.get_tty,
+        getuid = function()
+            return vfs_syscalls.get_process(pid).uid
+        end,
+        socket = vfs_syscalls.socket,
+        bind = function(fd, port)
+            local state = vfs_syscalls.get_process(pid)
+            local fd_obj = state.fds[fd]
+
+            if not fd_obj or fd_obj.type ~= "socket" then return false, "Not a socket" end
+
+            local ok, err = net_driver.bind(pid, fd_obj, port)
+
+            if ok then
+                vfs_syscalls.register_port(fd, port)
+            end
+
+            return ok, err
+        end,
+        connect = function(fd, remote_id, remote_port)
+            local state = vfs_syscalls.get_process(pid)
+            local fd_obj = state.fds[fd]
+
+            if not fd_obj or fd_obj.type ~= "socket" then return false, "Not a socket" end
+
+            local ok, err = net_driver.connect(pid, fd_obj, remote_id, remote_port)
+
+            if ok then
+                vfs_syscalls.register_port(fd, fd_obj.local_port, remote_id)
+            end
+
+            return ok, err
+        end,
+        send = function(fd, data)
+            local state = vfs_syscalls.get_process(pid)
+            local fd_obj = state.fds[fd]
+
+            if not fd_obj or fd_obj.type ~= "socket" then return false, "Not a socket" end
+
+            return net_driver.send(pid, fd_obj, data)
+        end,
+        recv = function(fd)
+            return vfs_syscalls.read(fd)
+        end,
+        get_port = function(fd)
+            local state = vfs_syscalls.get_process(pid)
+            local fd_obj = state.fds[fd]
+            if fd_obj then return fd_obj.local_port end
+        end,
+        encrypt = function (message, secret, nonce)
+            return krng.encrypt(message, secret, nonce)
+        end,
+        sha256 = function(data)
+            local _, bin = krng.sha256(data)
+            return bin
+        end,
+        sudo = function(username, password_attempt, app_route, options, ...)
+            local caller_state = vfs_syscalls.get_process(pid)
+            local caller_uid = caller_state and caller_state.uid or 1000
+
+            if caller_uid == 0 then
+                options = options or {}
+                options.uid = 0
+                options.parent_pid = pid
+
+                if syscalls and syscalls.launch then
+                    return syscalls.launch(app_route, options, ...)
+                else
+                    error("No syscall interface")
+                end
+            end
+
+            local now = _G.os.epoch("utc")
+            local has_cache = sudo_cache[username] and (now - sudo_cache[username] < SUDO_TIMEOUT)
+
+            if not has_cache and not password_attempt then
+                return nil, "AUTH_REQUIRED"
+            end
+
+            local vfs = require("iDar.opt.Loom.vfs")
+            local group_raw = vfs.kernel_read_file("/iDar", "/", "/etc/group")
+            local shadow_raw = vfs.kernel_read_file("/iDar", "/", "/etc/shadow")
+            local group_data = _G.textutils.unserialize(group_raw) or {}
+            local shadow_data = _G.textutils.unserialize(shadow_raw) or {}
+
+            local is_wheel = false
+            if group_data["wheel"] and group_data["wheel"].members then
+                for _, member in ipairs(group_data["wheel"].members) do
+                    if member == username then is_wheel = true break end
+                end
+            end
+
+            if not is_wheel then return nil, username .. " is not in the sudoers file. This incident will be reported." end
+
+            local auth_success = false
+
+            if has_cache and not password_attempt then
+                auth_success = true
+            else
+                local user_shadow = shadow_data[username]
+                if user_shadow then
+                    local input_hash_bin = env.sys.sha256(password_attempt .. user_shadow.salt)
+                    local input_hash_hex = ""
+                    for i = 1, #input_hash_bin do
+                        input_hash_hex = input_hash_hex .. string.format("%02x", string.byte(input_hash_bin, i))
+                    end
+                    if input_hash_hex == user_shadow.hash then auth_success = true end
+                end
+            end
+
+            if not auth_success then return nil, "Incorrect password." end
+
+            sudo_cache[username] = now
+
+            options = options or {}
+            options.uid = 0
+            options.parent_pid = pid
+
+            return syscalls.launch(app_route, options, ...)
+        end,
         combine = _G.fs.combine,
     }
 
@@ -214,34 +372,37 @@ function sandbox.create(syscalls, custom_term, pid)
     }
 
     env.require = function(modname)
-        local is_shared_lib = not modname:match("^opt%.")
-
-        if is_shared_lib and shared_lib_cache[modname] ~= nil then
-            return shared_lib_cache[modname]
-        end
-
         if env.package.loaded[modname] ~= nil then
             return env.package.loaded[modname]
         end
 
+        local is_shared_lib = not modname:match("^opt%.")
         local modpath = modname:gsub("%.", "/")
         local content = nil
         local found_path = nil
 
-        for pattern in string.gmatch(env.package.path, "([^;]+)") do
-            local try_path = pattern:gsub("?", modpath)
-
-            local fd = vfs_syscalls.open(try_path, "r")
-            if fd then
-                content = vfs_syscalls.read(fd)
-                vfs_syscalls.close(fd)
-                found_path = try_path
-                break
+        if is_shared_lib and shared_lib_cache[modname] ~= nil then
+            content = shared_lib_cache[modname].content
+            found_path = shared_lib_cache[modname].path
+        else
+            for pattern in string.gmatch(env.package.path, "([^;]+)") do
+                local try_path = pattern:gsub("?", modpath)
+                local fd = vfs_syscalls.open(try_path, "r")
+                if fd then
+                    content = vfs_syscalls.read(fd)
+                    vfs_syscalls.close(fd)
+                    found_path = try_path
+                    break
+                end
             end
-        end
 
-        if not content then
-            error("module '" .. modname .. "' not found in iDar VFS")
+            if not content then
+                error("module '" .. modname .. "' not found in iDar VFS")
+            end
+
+            if is_shared_lib then
+                shared_lib_cache[modname] = { content = content, path = found_path }
+            end
         end
 
         local func, compile_err = load(content, found_path, "t", env)
@@ -254,11 +415,7 @@ function sandbox.create(syscalls, custom_term, pid)
             result = true
         end
 
-        if is_shared_lib then
-            shared_lib_cache[modname] = result
-        else
-            env.package.loaded[modname] = result
-        end
+        env.package.loaded[modname] = result
 
         return result
     end
@@ -276,8 +433,10 @@ function sandbox.create(syscalls, custom_term, pid)
         env.sys.write(1, final_string)
     end
 
-    env.read = function(prompt_text, prompt_color, history_table, completion_fn)
+    env.read = function(prompt_text, prompt_color, history_table, completion_fn , replace_char)
+        local term = vfs_syscalls.get_tty()
         completion_fn = completion_fn or function(_) end
+        history_table = history_table or {}
         local input = ""
         local cursor_pos = 1
         local ctrl_held = false
@@ -291,13 +450,19 @@ function sandbox.create(syscalls, custom_term, pid)
 
             term.setCursorPos(start_x, start_y)
 
-            local text_to_draw = prompt_text .. input
+            local display_input = input
+
+            if replace_char then
+                display_input = string.rep(replace_char, #input)
+            end
+
+            local text_to_draw = prompt_text .. display_input
             local current_length = #text_to_draw
 
             term.setTextColor(prompt_color or colors.yellow)
             env.sys.write(1, prompt_text)
             term.setTextColor(colors.white)
-            env.sys.write(1, input)
+            env.sys.write(1, display_input)
 
             if current_length < max_length_drawn then
                 for i = current_length, max_length_drawn - 1 do
@@ -312,7 +477,13 @@ function sandbox.create(syscalls, custom_term, pid)
                 max_length_drawn = current_length
             end
 
-            local linear_index = (start_x - 1) + #prompt_text + (cursor_pos - 1)
+            local visual_cursor_pos = cursor_pos
+
+            if replace_char == " " then
+                visual_cursor_pos = 1
+            end
+
+            local linear_index = (start_x - 1) + #prompt_text + (visual_cursor_pos - 1)
             local target_x = (linear_index % w) + 1
             local target_y = start_y + math.floor(linear_index / w)
 
@@ -391,7 +562,7 @@ function sandbox.create(syscalls, custom_term, pid)
                                     cursor_pos = cursor_pos + #common
                                     needs_draw = true
                                 else
-                                    print()
+                                    env.print()
                                     local full_matches = {}
                                     for _, m in ipairs(matches) do
                                         table.insert(full_matches, partial .. m:gsub("%s$", ""))
@@ -399,7 +570,7 @@ function sandbox.create(syscalls, custom_term, pid)
 
                                     local old_color = term.getTextColor()
                                     term.setTextColor(colors.cyan)
-                                    print(table.concat(full_matches, "   "))
+                                    env.print(table.concat(full_matches, "   "))
                                     term.setTextColor(old_color)
 
                                     needs_draw = true
@@ -410,7 +581,7 @@ function sandbox.create(syscalls, custom_term, pid)
 
                 elseif param == keys.enter or param == keys.numPadEnter then
                     term.setCursorBlink(false)
-                    print()
+                    env.print()
                     return input
 
                 elseif param == keys.up then
@@ -456,7 +627,11 @@ function sandbox.create(syscalls, custom_term, pid)
         end
     end
 
-    env.term = custom_term or term
+    env.load = function(chunk, chunkname, mode, custom_env)
+        return load(chunk, chunkname, mode, custom_env or env)
+    end
+
+    env.term = custom_term or env.sys.get_tty()
 
     return env
 end

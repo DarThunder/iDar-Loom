@@ -28,7 +28,7 @@ function core.launch(app_route, options, ...)
     local env = sandbox.create(syscalls, options and options.term or nil, pid)
     local func, err = load(content, app_route, "t", env)
 
-    if not func then error("Error: " .. tostring(err)) end
+    if not func then error("Error: " .. app_route) end
 
     local args = {...}
 
@@ -51,7 +51,9 @@ function core.launch(app_route, options, ...)
             }
         }
     }
-    table.insert(scheduler.processes, new_process)
+
+    new_process.superrr = (options and options.superrr) or 0
+    scheduler.join_party(new_process)
 
     return pid
 end
