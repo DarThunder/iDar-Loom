@@ -95,3 +95,31 @@ Bug fixes and performance improvements
 
 - **Coroutine Hook Evolution:** The `debug.sethook` implementation was refactored to support the new `vruntime` calculation and forced-yield logic of the CFS Min-Heap.
 - **Global Environment (`_OS`):** Kernel version in the injected `_OS` table bumped to reflect the Alpha 3 microkernel architecture.
+
+### v4.0.0
+
+### Added
+
+#### Core Kernel & Syscalls
+
+- **POSIX Software Interrupts:** Deprecated the legacy `sys` API table injection in favor of a true software-interrupt architecture. Userspace applications now interact with the kernel by yielding a sequential table with hexadecimal syscall IDs (e.g., `0x00` for read, `0x01` for write, `0x3B` for execve).
+- **Syscall Dispatcher:** Introduced `ksyscalls.lua` to securely route hexadecimal requests to Ring 0 functions.
+- **POSIX Error Codes:** The kernel now maps failures to standard C `errno` codes, returning negative values (e.g., `-errno.EBADF`, `-errno.ENOENT`, `-errno.EACCES`) on failed syscalls instead of generic boolean flags.
+- **Userland C-Libraries:** Introduced standard wrapper libraries (`unistd` and `stdio` in `Clib`) to abstract the raw CISS hexadecimal yields from end-user programs.
+
+#### Virtual Terminals (TTY) & ANSI
+
+- **Multi-Console Multiplexing:** Implemented a kernel-level TTY driver (`tty.lua`) that handles up to 6 virtual consoles simultaneously.
+- **Hardware Hot-Swapping:** Users can instantly switch the active foreground console and keyboard input routing using `Ctrl + 1` through `Ctrl + 6`.
+- **Native ANSI Support:** The TTY driver features a built-in parser for ANSI escape sequences, managing text colors, background colors, cursor positioning, and line clearing directly at the kernel level.
+
+#### Virtual File System (VFS)
+
+- **Synthetic Filesystems (`/proc` and `/sys`):** The VFS now dynamically generates system and hardware status files. Added `/proc/cpuinfo` (virtual CPU stats and BogoMIPS), `/proc/meminfo` (simulated RAM usage), `/proc/uptime`, and `/proc/version`.
+- **Network Hardware Addresses:** Added `/sys/class/net/modem0/address` to expose the physical computer ID as a standard MAC address.
+- **SUID Execution:** Process creation (`execve`) now evaluates the Set-User-ID (SUID) bit via file attributes, seamlessly assigning the effective UID of the file owner upon execution for secure privilege escalation.
+
+### Changed
+
+- **Process Management:** Completely removed string-based task commands (like `"fork"`, `"wait"`, `"get_pid"`). All process lifecycle management is now strictly handled through the `0x01` syscall bus using their POSIX hex IDs (`0x3B execve`, `0x3D wait`, `0x27 getpid`).
+- **Scheduler Tuning:** Refactored scheduler configuration in `boot/config.lua`. Replaced static base times with `target_latency` and `min_granularity` variables for a more mathematically accurate Completely Fair Scheduler (CFS) time-slicing equation.

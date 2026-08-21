@@ -302,6 +302,6 @@ function krng.read_random_bytes(num_bytes)
     return result
 end
 
-krng.read_random_bytes(1)
+krng.read_random_bytes(1) --Quiero queque
 
 return krng

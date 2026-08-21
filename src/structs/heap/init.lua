@@ -1,4 +1,4 @@
-local binary_heap = require("iDar.opt.Loom.structs.heap.binary_heap")
+local binary_heap = require("iDar.boot.Loom.structs.heap.binary_heap")
 
 return {
     new_min = function(list, comp_func)
